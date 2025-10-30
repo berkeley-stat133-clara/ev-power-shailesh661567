@@ -1,34 +1,214 @@
 ---
-title: "EV Power - Lab 4 Project Report"
-format: typst
+title: "Clean Energy and Electric Vehicles: Which States Are Best Positioned for Clean EV Charging?"
+author: "Shailesh Nagalingam"
+date: "`r Sys.Date()`"
+format: 
+  pdf:
+    toc: false
+    number-sections: false
 ---
-
-# Example Solution 1
-
-## **Part 0: libraries**
-
-```{r}
-
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(leaflet)
+library(sf)
+library(maps)
+library(knitr)
 ```
 
-## **Part 1:** **Defining Research Question**
+## Overview
 
-Chosen Question:
+This analysis addresses the main research question: "Electric vehicles reduce direct emissions, but does the electricity used to charge them actually come from clean sources?" 
 
-## **Part 2: Data Preparation and Cleaning**
+My specific sub-question focuses on **"Which states are best positioned for clean EV charging?"** - examining the relationship between renewable energy infrastructure and EV adoption across US states. This is critical because EVs are only as clean as the electricity grid they charge from.
 
-```{r}
+## Data and Methods
 
+### Data Sources
+The analysis uses four datasets from 2021-2023:
+- Electric Vehicle registrations by state (2023)
+- Renewable energy use by state and source
+- Total energy use by state and source
+- Average energy prices by state
+
+### Data Cleaning and Preparation
+```{r data-loading}
+# Load and clean EV data
+ev_data <- read_csv("data/ev-registrations-by-state-2023.csv", skip = 1) %>%
+  rename(state = 1, ev_count = 2) %>%
+  filter(state != "STATE") %>%
+  mutate(ev_count = str_remove_all(ev_count, "[#~EVs ]"),
+         ev_count = as.numeric(ev_count))
+
+# Load total energy data for 2023
+total_2023 <- read_csv("data/total-use-2023.csv")
+
+# Get renewable energy by state
+renewable_by_state <- total_2023 %>%
+  filter(Energy_Source == "total renewable-energy") %>%
+  pivot_longer(cols = -Energy_Source, names_to = "state_abbr", values_to = "renewable_energy") %>%
+  filter(state_abbr != "US") %>%
+  select(state_abbr, renewable_energy)
+
+# Calculate total energy by state
+total_by_state <- total_2023 %>%
+  pivot_longer(cols = -Energy_Source, names_to = "state_abbr", values_to = "energy_value") %>%
+  filter(state_abbr != "US") %>%
+  group_by(state_abbr) %>%
+  summarize(total_energy = sum(energy_value, na.rm = TRUE))
+
+# Clean price data
+price_data <- read_csv("data/av-energy-price-2021-2023.csv", skip = 2) %>%
+  separate(1, into = c("state", "price_2021", "price_2022", "price_2023"), sep = ",") %>%
+  mutate(price_2023_clean = as.numeric(str_extract(price_2023, "[0-9.]+")),
+         state = str_trim(state))
 ```
 
-## **Part 3: Joining / Pivoting Datasets for Analysis**
+### Joining Datasets
+```{r data-joining}
+# Create state lookup table
+state_lookup <- data.frame(
+  state_abbr = state.abb,
+  state = state.name
+) %>%
+  add_row(state_abbr = "DC", state = "District of Columbia")
 
-```{r}
+# Calculate renewable percentage and join all data
+final_data <- total_by_state %>%
+  left_join(renewable_by_state, by = "state_abbr") %>%
+  mutate(renewable_percent = (renewable_energy / total_energy) * 100) %>%
+  left_join(state_lookup, by = "state_abbr") %>%
+  left_join(ev_data, by = "state") %>%
+  left_join(price_data %>% select(state, price_2023_clean), by = "state") %>%
+  filter(!is.na(state)) %>%
+  mutate(
+    ev_per_million_btu = (ev_count / total_energy) * 1000000,
+    clean_ev_score = renewable_percent * log(ev_count + 1)
+  )
 
+# Show sample of joined data
+head(final_data %>% 
+  select(state, renewable_percent, ev_count, total_energy, price_2023_clean) %>%
+  arrange(desc(renewable_percent))) %>%
+  kable(digits = 1, caption = "Top States by Renewable Energy Percentage")
 ```
 
-## **Part 4: Mapping Visualization**
+## Map Visualization
 
-```{r}
+### Renewable Energy Percentage by State
+```{r map-renewable, fig.width=10, fig.height=6}
+# Get US state map data
+states_map <- map_data("state") %>%
+  mutate(state = str_to_title(region))
 
+# Join with our data
+map_data <- states_map %>%
+  left_join(final_data, by = "state")
+
+# Create choropleth map
+ggplot(map_data, aes(x = long, y = lat, group = group)) +
+  geom_polygon(aes(fill = renewable_percent), color = "white", size = 0.2) +
+  scale_fill_gradient2(
+    low = "#d73027",
+    mid = "#fee08b", 
+    high = "#1a9850",
+    midpoint = 15,
+    name = "Renewable\nEnergy %",
+    limits = c(0, 35),
+    breaks = c(0, 10, 20, 30)
+  ) +
+  coord_fixed(1.3) +
+  theme_minimal() +
+  labs(
+    title = "Which States Are Best Positioned for Clean EV Charging?",
+    subtitle = "Percentage of Total Energy from Renewable Sources (2023)",
+    caption = "Source: US Energy Information Administration"
+  ) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank()
+  )
 ```
+
+### EV Adoption vs Clean Energy Mix
+```{r scatter-plot, fig.width=10, fig.height=6}
+ggplot(final_data, aes(x = renewable_percent, y = ev_count)) +
+  geom_point(aes(size = total_energy/1000, color = price_2023_clean), alpha = 0.7) +
+  geom_text(
+    data = final_data %>% filter(ev_count > 100000 | renewable_percent > 25),
+    aes(label = state_abbr),
+    vjust = -0.5, size = 3
+  ) +
+  scale_y_log10(labels = scales::comma) +
+  scale_x_continuous(breaks = seq(0, 35, 5)) +
+  scale_color_gradient(low = "#1a9850", high = "#d73027", name = "Energy Price\n($/MMBtu)") +
+  scale_size_continuous(name = "Total Energy\nUse (PBtu)", range = c(2, 12)) +
+  labs(
+    x = "Renewable Energy Percentage (%)",
+    y = "EV Registrations (log scale)",
+    title = "States with High Renewable Energy Don't Always Have High EV Adoption",
+    subtitle = "Size represents total energy consumption; Color represents energy price"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "right"
+  )
+```
+
+## Analysis
+
+### Key Findings
+```{r analysis-tables}
+# Best positioned states (high renewable % AND good EV adoption)
+best_states <- final_data %>%
+  filter(renewable_percent > 20 & ev_count > 5000) %>%
+  arrange(desc(clean_ev_score)) %>%
+  select(state, renewable_percent, ev_count, clean_ev_score) %>%
+  head(8)
+
+kable(best_states, 
+      col.names = c("State", "Renewable %", "EV Count", "Clean EV Score"),
+      digits = 1,
+      caption = "Best Positioned States for Clean EV Charging")
+
+# States with mismatched renewable energy and EV adoption
+high_renewable_low_ev <- final_data %>%
+  filter(renewable_percent > 25 & ev_count < 10000) %>%
+  select(state, renewable_percent, ev_count)
+
+high_ev_low_renewable <- final_data %>%
+  filter(ev_count > 50000 & renewable_percent < 10) %>%
+  select(state, renewable_percent, ev_count)
+```
+
+### Patterns Observed
+
+1. **Geographic Clustering**: States in the Pacific Northwest (Washington, Oregon) show both high renewable energy percentages and strong EV adoption, making them ideal for clean EV charging.
+
+2. **Renewable Energy Leaders**: South Dakota (34.8%), Iowa (28.3%), and Maine (27.2%) lead in renewable energy percentage but have relatively low EV adoption, suggesting untapped potential.
+
+3. **EV Adoption Leaders**: California has by far the most EVs (1.26 million) but only moderate renewable energy (16.6%). This means many California EVs are charged with fossil fuel-based electricity.
+
+4. **Price Influence**: States with lower energy prices tend to have higher EV adoption, though this relationship is complex and influenced by other factors like state policies and urban density.
+
+### Answering the Main Question
+
+The analysis reveals a critical insight: **Most electric vehicles in the US are NOT charged with predominantly clean energy**. While EVs eliminate tailpipe emissions, their environmental benefit is limited by the electricity grid's energy mix.
+
+**Best positioned states** for truly clean EV transportation are:
+- **Washington**: 22.5% renewable energy, 152,101 EVs
+- **Oregon**: 26.9% renewable energy, 64,361 EVs  
+- **California**: Despite having the most EVs, only 16.6% renewable energy
+
+**Recommendations**:
+1. States with high renewable energy should incentivize EV adoption
+2. States with high EV adoption should accelerate renewable energy deployment
+3. Federal coordination could help match EV infrastructure investment with clean energy development
+
+The transition to electric vehicles must be coupled with a transition to renewable electricity generation to achieve meaningful emissions reductions.
